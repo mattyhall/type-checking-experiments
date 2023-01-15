@@ -49,17 +49,45 @@ pub const Expr = union(enum) {
     }
 };
 
-pub const Type = union(enum) {
+pub const TypeOrGeneric = union(enum) {
+    concrete: Type,
+    generic: u32,
+
+    pub fn format(self: *const TypeOrGeneric, comptime fmt: []const u8, opts: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = opts;
+        _ = fmt;
+        switch (self) {
+            .concrete => |t| try writer.print("{}", .{t}),
+            .generic => |n| try writer.print("g{}", .{n}),
+        }
+    }
+};
+
+pub const ConstType = enum {
     int,
     boolean,
     string,
-    construct: struct { constructor: []const u8, args: []TypeVar },
+
+    pub fn format(self: *const ConstType, comptime fmt: []const u8, opts: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = opts;
+        _ = fmt;
+        switch (self.*) {
+            .int => try writer.writeAll("Int"),
+            .boolean => try writer.writeAll("Bool"),
+            .string => try writer.writeAll("String"),
+        }
+    }
+};
+
+pub const Type = union(enum) {
+    constant: ConstType,
+    construct: struct { constructor: []const u8, args: []TypeOrGeneric },
 
     fn eql(lhs: Type, rhs: Type) bool {
         if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
 
         switch (lhs) {
-            .int, .boolean, .string => return true,
+            .constant => |t| return t == rhs.constant,
             .construct => |c| {
                 if (!std.mem.eql(u8, c.constructor, rhs.construct.constructor)) return false;
 
@@ -79,9 +107,7 @@ pub const Type = union(enum) {
         _ = opts;
         _ = fmt;
         switch (self.*) {
-            .int => try writer.writeAll("Int"),
-            .boolean => try writer.writeAll("Bool"),
-            .string => try writer.writeAll("String"),
+            .constant => |t| try writer.print("{}", .{t}),
             .construct => |c| {
                 try writer.print("({s} ", .{c.constructor});
                 for (c.args) |arg, i| {
@@ -95,14 +121,26 @@ pub const Type = union(enum) {
 };
 
 pub const TypeVar = union(enum) {
-    concrete: Type,
+    constant: ConstType,
+    construct: struct { constructor: []const u8, args: []TypeVar },
     variable: u32,
 
     fn eql(lhs: TypeVar, rhs: TypeVar) bool {
         if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
 
         return switch (lhs) {
-            .concrete => |c| c.eql(rhs.concrete),
+            .constant => |c| c == rhs.constant,
+            .construct => |c| {
+                if (!std.mem.eql(u8, c.constructor, rhs.construct.constructor)) return false;
+
+                if (c.args.len != rhs.construct.args.len) return false;
+                for (c.args) |lhs_arg, i| {
+                    const rhs_arg = rhs.construct.args[i];
+                    if (!lhs_arg.eql(rhs_arg)) return false;
+                }
+
+                return true;
+            },
             .variable => |v| v == rhs.variable,
         };
     }
@@ -111,7 +149,15 @@ pub const TypeVar = union(enum) {
         _ = opts;
         _ = fmt;
         switch (self.*) {
-            .concrete => |t| try writer.print("{}", .{t}),
+            .constant => |t| try writer.print("{}", .{t}),
+            .construct => |c| {
+                try writer.print("({s} ", .{c.constructor});
+                for (c.args) |arg, i| {
+                    try writer.print("{}", .{arg});
+                    if (i < c.args.len - 1) try writer.writeAll(" ");
+                }
+                try writer.writeAll(")");
+            },
             .variable => |u| try writer.print("t{}", .{u}),
         }
     }
@@ -192,9 +238,9 @@ const Analysis = struct {
                 try self.constraints.append(self.gpa, .{ .lhs = tv, .rhs = gop.value_ptr.* });
             },
             .literal => |l| try self.constraints.append(self.gpa, .{ .lhs = tv, .rhs = switch (l) {
-                .int => .{ .concrete = .int },
-                .boolean => .{ .concrete = .boolean },
-                .string => .{ .concrete = .string },
+                .int => .{ .constant = .int },
+                .boolean => .{ .constant = .boolean },
+                .string => .{ .constant = .string },
             } }),
             .function => |f| {
                 try self.var_type_vars.put(self.gpa, f.name, tv);
@@ -213,7 +259,7 @@ const Analysis = struct {
                 try self.constraints.append(self.gpa, .{
                     .lhs = tv,
                     .rhs = .{
-                        .concrete = .{ .construct = .{ .constructor = "->", .args = try args.toOwnedSlice(self.gpa) } },
+                        .construct = .{ .constructor = "->", .args = try args.toOwnedSlice(self.gpa) },
                     },
                 });
             },
@@ -233,7 +279,7 @@ const Analysis = struct {
                 try self.constraints.append(self.gpa, .{
                     .lhs = f_tv,
                     .rhs = .{
-                        .concrete = .{ .construct = .{ .constructor = "->", .args = try args.toOwnedSlice(self.gpa) } },
+                        .construct = .{ .constructor = "->", .args = try args.toOwnedSlice(self.gpa) },
                     },
                 });
             },
@@ -284,15 +330,13 @@ const Analysis = struct {
                 tv.* = with;
                 return true;
             } else {},
-            .concrete => |t| switch (t) {
-                .construct => |c| {
-                    var ret = false;
-                    for (c.args) |*arg| {
-                        ret = ret or self.replaceTypeVar(arg, to_be_replaced, with);
-                    }
-                    return ret;
-                },
-                else => {},
+            .constant => {},
+            .construct => |c| {
+                var ret = false;
+                for (c.args) |*arg| {
+                    ret = ret or self.replaceTypeVar(arg, to_be_replaced, with);
+                }
+                return ret;
             },
         }
 
@@ -355,23 +399,13 @@ const Analysis = struct {
                     continue;
                 }
 
-                if ((constraint.lhs != .concrete or constraint.lhs.concrete != .construct) or
-                    (constraint.rhs != .concrete or constraint.rhs.concrete != .construct))
-                {
-                    continue;
-                }
+                if (constraint.lhs != .construct or constraint.rhs != .construct) continue;
 
-                std.debug.print("both constructors\n", .{});
+                var lhs = constraint.lhs.construct;
+                var rhs = constraint.rhs.construct;
+                if (!std.mem.eql(u8, lhs.constructor, rhs.constructor)) continue;
 
-                var lhs = constraint.lhs.concrete.construct;
-                var rhs = constraint.rhs.concrete.construct;
-                if (!std.mem.eql(u8, lhs.constructor, rhs.constructor)) {
-                    continue;
-                }
-
-                if (lhs.args.len != rhs.args.len) {
-                    continue;
-                }
+                if (lhs.args.len != rhs.args.len) continue;
 
                 if (self.debug) std.debug.print("{}: Expanding\n", .{constraint});
 
