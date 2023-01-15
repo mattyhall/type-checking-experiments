@@ -485,6 +485,26 @@ const Analysis = struct {
         };
     }
 
+    fn find(self: *Analysis, start: u32) !Type {
+        var v = start;
+
+        while (true) {
+            for (self.subs.items) |s| {
+                if (s.lhs == .variable and s.lhs.variable == v) {
+                    switch (s.rhs) {
+                        .constant => |c| return .{ .constant = c },
+                        .variable => |v2| v = v2,
+                        .construct => {
+                            var map = std.AutoHashMapUnmanaged(u32, u32){};
+                            var tog = try self.generalise(s.rhs, &map);
+                            return tog.concrete;
+                        },
+                    }
+                }
+            }
+        }
+    }
+
     fn infer(self: *Analysis, exprs: []const *Expr) !void {
         for (exprs) |ex| {
             const res = try self.generateConstraints(ex);
@@ -503,20 +523,13 @@ const Analysis = struct {
                 std.debug.print("Looking for {}\n", .{res});
             }
 
-            for (self.subs.items) |s| {
-                if (s.lhs != .variable or s.lhs.variable != res.variable) continue;
-                if (s.rhs == .variable) unreachable;
-
-                var map = std.AutoHashMapUnmanaged(u32, u32){};
-                var tog = try self.generalise(s.rhs, &map);
-
-                if (self.debug) std.debug.print("{}\n", .{tog.concrete});
-
-                switch (ex.*) {
-                    .function => |f| try self.decl_types.put(self.gpa, f.name, tog.concrete),
-                    else => {},
-                }
+            var ty = try self.find(res.variable);
+            switch (ex.*) {
+                .function => |f| try self.decl_types.put(self.gpa, f.name, ty),
+                else => {},
             }
+
+            std.debug.print("{}\n", .{ty});
 
             self.expr_type_vars.clearRetainingCapacity();
             self.var_type_vars.clearRetainingCapacity();
@@ -535,8 +548,10 @@ pub fn main() !void {
     var b = ExprBuilder{ .gpa = a };
 
     var al = std.ArrayListUnmanaged(*Expr){};
-    try al.append(a, try b.function("id", &[1][]const u8{"x"}, try b.variable("x")));
-    try al.append(a, try b.apply(try b.variable("id"), &[1]*Expr{try b.lit(.{ .int = 5 })}));
+    try al.append(a, try b.function("id", &[_][]const u8{"x"}, try b.variable("x")));
+    try al.append(a, try b.function("const", &[_][]const u8{ "x", "y" }, try b.variable("x")));
+    try al.append(a, try b.apply(try b.variable("id"), &[_]*Expr{try b.lit(.{ .int = 5 })}));
+    try al.append(a, try b.apply(try b.variable("const"), &[_]*Expr{ try b.variable("id"), try b.lit(.{ .int = 5 }) }));
 
     for (al.items) |expr| {
         std.debug.print("{}\n", .{expr});
