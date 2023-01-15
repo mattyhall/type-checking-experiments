@@ -20,8 +20,8 @@ pub const Parameter = []const u8;
 pub const Expr = union(enum) {
     variable: []const u8,
     literal: Literal,
-    function: struct { name: []const u8, params: []Parameter, body: *Expr },
-    apply: struct { function: *Expr, arguments: []*Expr },
+    function: struct { name: []const u8, params: []const Parameter, body: *Expr },
+    apply: struct { function: *Expr, arguments: []const *Expr },
 
     pub fn format(self: *const Expr, comptime fmt: []const u8, opts: std.fmt.FormatOptions, writer: anytype) !void {
         _ = opts;
@@ -88,6 +88,32 @@ pub const TypeVar = union(enum) {
     }
 };
 
+const ExprBuilder = struct {
+    gpa: std.mem.Allocator,
+
+    fn e(self: *ExprBuilder, expr: Expr) !*Expr {
+        var ex = try self.gpa.create(Expr);
+        ex.* = expr;
+        return ex;
+    }
+
+    fn lit(self: *ExprBuilder, l: Literal) !*Expr {
+        return self.e(.{ .literal = l });
+    }
+
+    fn variable(self: *ExprBuilder, s: []const u8) !*Expr {
+        return self.e(.{ .variable = s });
+    }
+
+    fn function(self: *ExprBuilder, name: []const u8, params: []const Parameter, body: *Expr) !*Expr {
+        return self.e(.{ .function = .{ .name = name, .params = params, .body = body } });
+    }
+
+    fn apply(self: *ExprBuilder, func: *Expr, arguments: []const *Expr) !*Expr {
+        return self.e(.{ .apply = .{ .function = func, .arguments = arguments } });
+    }
+};
+
 pub const Constraint = union(enum) { eq: struct { lhs: TypeVar, rhs: TypeVar } };
 
 pub const Subsitutions = std.AutoHashMap(TypeVar, TypeVar);
@@ -109,12 +135,11 @@ pub fn main() !void {
 
     var a = arena.allocator();
 
-    var params: [1][]const u8 = [1][]const u8{"x"};
-    var args: [1]*Expr = [1]*Expr{try e(a, Expr{ .literal = .{ .int = 4 } })};
+    var b = ExprBuilder{ .gpa = a };
 
-    var al = std.ArrayListUnmanaged(Expr){};
-    try al.append(a, Expr{ .function = .{ .name = "id", .params = &params, .body = try e(a, Expr{ .variable = "x" }) } });
-    try al.append(a, Expr{ .apply = .{ .function = try e(a, Expr{ .variable = "id" }), .arguments = &args } });
+    var al = std.ArrayListUnmanaged(*Expr){};
+    try al.append(a, try b.function("id", &[1][]const u8{"x"}, try b.variable("x")));
+    try al.append(a, try b.apply(try b.variable("id"), &[1]*Expr{try b.lit(.{ .int = 5 })}));
 
     for (al.items) |expr| {
         std.debug.print("{}\n", .{expr});
