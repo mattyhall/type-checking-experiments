@@ -229,11 +229,39 @@ const Analysis = struct {
         return tv;
     }
 
+    fn expandGeneric(self: *Analysis, t: Type) !TypeVar {
+        return switch (t) {
+            .constant => |c| .{ .constant = c },
+            .construct => |c| b: {
+                var map = std.AutoHashMapUnmanaged(u32, u32){};
+
+                var args = std.ArrayListUnmanaged(TypeVar){};
+                for (c.args) |arg| {
+                    try args.append(self.gpa, switch (arg) {
+                        .concrete => |conc| try self.expandGeneric(conc),
+                        .generic => |g| b2: {
+                            var gop = try map.getOrPut(self.gpa, g);
+                            if (!gop.found_existing) gop.value_ptr.* = self.tyvar().variable;
+                            break :b2 .{ .variable = gop.value_ptr.* };
+                        },
+                    });
+                }
+                break :b .{ .construct = .{ .constructor = c.constructor, .args = try args.toOwnedSlice(self.gpa) } };
+            },
+        };
+    }
+
     fn generateConstraints(self: *Analysis, expr: *const Expr) !TypeVar {
         const tv = self.tyvar();
         switch (expr.*) {
             .variable => |v| {
                 try self.expr_type_vars.put(self.gpa, expr, tv);
+
+                if (self.decl_types.get(v)) |t| {
+                    const rhs = try self.expandGeneric(t);
+                    try self.constraints.append(self.gpa, .{ .lhs = tv, .rhs = rhs });
+                    return tv;
+                }
 
                 var gop = try self.var_type_vars.getOrPut(self.gpa, v);
                 if (!gop.found_existing) gop.value_ptr.* = self.tyvar();
@@ -290,7 +318,7 @@ const Analysis = struct {
         return tv;
     }
 
-    fn printVarsAndConstraints(self: *const Analysis) !void {
+    fn printVars(self: *const Analysis) !void {
         std.debug.print("####################################\n", .{});
         std.debug.print("=============== VARS ===============\n", .{});
         {
@@ -304,7 +332,9 @@ const Analysis = struct {
             while (it.next()) |entry|
                 std.debug.print("{} : {}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
         }
+    }
 
+    fn printConstraints(self: *const Analysis) !void {
         std.debug.print("============ CONSTRAINT ============\n", .{});
         for (self.constraints.items) |constraint| {
             std.debug.print("{}\n", .{constraint});
@@ -459,9 +489,19 @@ const Analysis = struct {
         for (exprs) |ex| {
             const res = try self.generateConstraints(ex);
 
-            if (self.debug) try self.printVarsAndConstraints();
+            if (self.debug) {
+                try self.printVars();
+                try self.printConstraints();
+            }
 
             try self.solve();
+
+            if (self.debug) try self.printConstraints();
+
+            if (self.debug) {
+                std.debug.print("============== RESULT ==============\n", .{});
+                std.debug.print("Looking for {}\n", .{res});
+            }
 
             for (self.subs.items) |s| {
                 if (s.lhs != .variable or s.lhs.variable != res.variable) continue;
@@ -470,7 +510,7 @@ const Analysis = struct {
                 var map = std.AutoHashMapUnmanaged(u32, u32){};
                 var tog = try self.generalise(s.rhs, &map);
 
-                if (self.debug) std.debug.print("!!! Result is {}\n", .{tog.concrete});
+                if (self.debug) std.debug.print("{}\n", .{tog.concrete});
 
                 switch (ex.*) {
                     .function => |f| try self.decl_types.put(self.gpa, f.name, tog.concrete),
@@ -481,6 +521,7 @@ const Analysis = struct {
             self.expr_type_vars.clearRetainingCapacity();
             self.var_type_vars.clearRetainingCapacity();
             self.constraints.clearRetainingCapacity();
+            self.subs.clearRetainingCapacity();
         }
     }
 };
@@ -495,7 +536,7 @@ pub fn main() !void {
 
     var al = std.ArrayListUnmanaged(*Expr){};
     try al.append(a, try b.function("id", &[1][]const u8{"x"}, try b.variable("x")));
-    // try al.append(a, try b.apply(try b.variable("id"), &[1]*Expr{try b.lit(.{ .int = 5 })}));
+    try al.append(a, try b.apply(try b.variable("id"), &[1]*Expr{try b.lit(.{ .int = 5 })}));
 
     for (al.items) |expr| {
         std.debug.print("{}\n", .{expr});
