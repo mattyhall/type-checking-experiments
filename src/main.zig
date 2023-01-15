@@ -56,7 +56,7 @@ pub const TypeOrGeneric = union(enum) {
     pub fn format(self: *const TypeOrGeneric, comptime fmt: []const u8, opts: std.fmt.FormatOptions, writer: anytype) !void {
         _ = opts;
         _ = fmt;
-        switch (self) {
+        switch (self.*) {
             .concrete => |t| try writer.print("{}", .{t}),
             .generic => |n| try writer.print("g{}", .{n}),
         }
@@ -207,6 +207,7 @@ const Analysis = struct {
     subs: std.ArrayListUnmanaged(struct { lhs: TypeVar, rhs: TypeVar }),
     expr_type_vars: std.AutoHashMapUnmanaged(*const Expr, TypeVar),
     var_type_vars: std.StringHashMapUnmanaged(TypeVar),
+    decl_types: std.StringHashMapUnmanaged(Type),
     debug: bool = false,
     next_var: u32,
 
@@ -217,6 +218,7 @@ const Analysis = struct {
             .var_type_vars = .{},
             .constraints = .{},
             .subs = .{},
+            .decl_types = .{},
             .next_var = 0,
         };
     }
@@ -426,14 +428,55 @@ const Analysis = struct {
         }
     }
 
+    fn generalise(self: *Analysis, tv: TypeVar, map: *std.AutoHashMapUnmanaged(u32, u32)) !TypeOrGeneric {
+        return switch (tv) {
+            .constant => |t| .{ .concrete = .{ .constant = t } },
+            .construct => |c| b: {
+                var args = std.ArrayListUnmanaged(TypeOrGeneric){};
+                for (c.args) |arg| {
+                    try args.append(self.gpa, try self.generalise(arg, map));
+                }
+
+                break :b .{ .concrete = .{ .construct = .{
+                    .constructor = c.constructor,
+                    .args = try args.toOwnedSlice(self.gpa),
+                } } };
+            },
+            .variable => |v| b: {
+                var next_generic: u32 = map.size;
+                var gop = try map.getOrPut(self.gpa, v);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = next_generic;
+                    next_generic += 1;
+                }
+
+                break :b .{ .generic = gop.value_ptr.* };
+            },
+        };
+    }
+
     fn infer(self: *Analysis, exprs: []const *Expr) !void {
         for (exprs) |ex| {
             const res = try self.generateConstraints(ex);
-            _ = res;
 
             if (self.debug) try self.printVarsAndConstraints();
 
             try self.solve();
+
+            for (self.subs.items) |s| {
+                if (s.lhs != .variable or s.lhs.variable != res.variable) continue;
+                if (s.rhs == .variable) unreachable;
+
+                var map = std.AutoHashMapUnmanaged(u32, u32){};
+                var tog = try self.generalise(s.rhs, &map);
+
+                if (self.debug) std.debug.print("!!! Result is {}\n", .{tog.concrete});
+
+                switch (ex.*) {
+                    .function => |f| try self.decl_types.put(self.gpa, f.name, tog.concrete),
+                    else => {},
+                }
+            }
 
             self.expr_type_vars.clearRetainingCapacity();
             self.var_type_vars.clearRetainingCapacity();
