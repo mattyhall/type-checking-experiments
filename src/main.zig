@@ -55,6 +55,26 @@ pub const Type = union(enum) {
     string,
     construct: struct { constructor: []const u8, args: []TypeVar },
 
+    fn eql(lhs: Type, rhs: Type) bool {
+        if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
+
+        switch (lhs) {
+            .int, .boolean, .string => return true,
+            .construct => |c| {
+                if (!std.mem.eql(u8, c.constructor, rhs.construct.constructor)) return false;
+
+                if (c.args.len != rhs.construct.args.len) return false;
+
+                for (c.args) |lhs_arg, i| {
+                    const rhs_arg = rhs.construct.args[i];
+                    if (!lhs_arg.eql(rhs_arg)) return false;
+                }
+
+                return true;
+            },
+        }
+    }
+
     pub fn format(self: *const Type, comptime fmt: []const u8, opts: std.fmt.FormatOptions, writer: anytype) !void {
         _ = opts;
         _ = fmt;
@@ -77,6 +97,15 @@ pub const Type = union(enum) {
 pub const TypeVar = union(enum) {
     concrete: Type,
     variable: u32,
+
+    fn eql(lhs: TypeVar, rhs: TypeVar) bool {
+        if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
+
+        return switch (lhs) {
+            .concrete => |c| c.eql(rhs.concrete),
+            .variable => |v| v == rhs.variable,
+        };
+    }
 
     pub fn format(self: *const TypeVar, comptime fmt: []const u8, opts: std.fmt.FormatOptions, writer: anytype) !void {
         _ = opts;
@@ -132,7 +161,7 @@ const Analysis = struct {
     subs: std.ArrayListUnmanaged(struct { lhs: TypeVar, rhs: TypeVar }),
     expr_type_vars: std.AutoHashMapUnmanaged(*const Expr, TypeVar),
     var_type_vars: std.StringHashMapUnmanaged(TypeVar),
-
+    debug: bool = false,
     next_var: u32,
 
     fn init(gpa: std.mem.Allocator) Analysis {
@@ -213,7 +242,8 @@ const Analysis = struct {
         return tv;
     }
 
-    fn debug(self: *const Analysis) !void {
+    fn printVarsAndConstraints(self: *const Analysis) !void {
+        std.debug.print("####################################\n", .{});
         std.debug.print("=============== VARS ===============\n", .{});
         {
             var it = self.var_type_vars.iterator();
@@ -233,10 +263,143 @@ const Analysis = struct {
         }
     }
 
+    fn printSubs(self: *const Analysis) void {
+        std.debug.print("[", .{});
+        for (self.subs.items) |s, i| {
+            std.debug.print("{} := {}", .{ s.lhs, s.rhs });
+            if (i < self.subs.items.len - 1) std.debug.print(", ", .{});
+        }
+        std.debug.print("]", .{});
+    }
+
+    fn printAddSub(self: *const Analysis, constraint: *const Constraint, to_be_replaced: TypeVar, with: TypeVar) void {
+        std.debug.print("{}: Adding {} := {} to ", .{ constraint, to_be_replaced, with });
+        self.printSubs();
+        std.debug.print("\n", .{});
+    }
+
+    fn replaceTypeVar(self: *Analysis, tv: *TypeVar, to_be_replaced: u32, with: TypeVar) bool {
+        switch (tv.*) {
+            .variable => |v| if (v == to_be_replaced) {
+                tv.* = with;
+                return true;
+            } else {},
+            .concrete => |t| switch (t) {
+                .construct => |c| {
+                    var ret = false;
+                    for (c.args) |*arg| {
+                        ret = ret or self.replaceTypeVar(arg, to_be_replaced, with);
+                    }
+                    return ret;
+                },
+                else => {},
+            },
+        }
+
+        return false;
+    }
+
+    fn replace(self: *Analysis, to_be_replaced: u32, with: TypeVar) void {
+        for (self.constraints.items) |*constraint| {
+            var orig = constraint.*;
+
+            if ((self.replaceTypeVar(&constraint.lhs, to_be_replaced, with) or
+                self.replaceTypeVar(&constraint.rhs, to_be_replaced, with)) and self.debug)
+            {
+                if (self.debug) std.debug.print("  {} => {}\n", .{ orig, constraint.* });
+            }
+        }
+    }
+
+    fn pruneConstraints(self: *Analysis) void {
+        var i: usize = 0;
+        while (i < self.constraints.items.len) {
+            const constraint = self.constraints.items[i];
+            if (constraint.lhs.eql(constraint.rhs)) {
+                std.debug.print("{}: Removing\n", .{constraint});
+                _ = self.constraints.swapRemove(i);
+                continue;
+            }
+
+            i += 1;
+        }
+    }
+
+    fn solve(self: *Analysis) !void {
+        if (self.debug) std.debug.print("============ UNIFICATION ===========\n", .{});
+
+        var made_progress = true;
+        while (made_progress) {
+            made_progress = false;
+
+            var to_add = std.ArrayListUnmanaged(Constraint){};
+
+            var i: usize = 0;
+            while (i < self.constraints.items.len) : (i += 1) {
+                var constraint = self.constraints.items[i];
+                if (constraint.lhs == .variable) {
+                    if (self.debug) self.printAddSub(&constraint, constraint.lhs, constraint.rhs);
+
+                    self.replace(constraint.lhs.variable, constraint.rhs);
+                    try self.subs.append(self.gpa, .{ .lhs = constraint.lhs, .rhs = constraint.rhs });
+                    made_progress = true;
+                    continue;
+                }
+
+                if (constraint.rhs == .variable) {
+                    if (self.debug) self.printAddSub(&constraint, constraint.rhs, constraint.lhs);
+
+                    self.replace(constraint.rhs.variable, constraint.lhs);
+                    try self.subs.append(self.gpa, .{ .lhs = constraint.rhs, .rhs = constraint.lhs });
+                    made_progress = true;
+                    continue;
+                }
+
+                if ((constraint.lhs != .concrete or constraint.lhs.concrete != .construct) or
+                    (constraint.rhs != .concrete or constraint.rhs.concrete != .construct))
+                {
+                    continue;
+                }
+
+                std.debug.print("both constructors\n", .{});
+
+                var lhs = constraint.lhs.concrete.construct;
+                var rhs = constraint.rhs.concrete.construct;
+                if (!std.mem.eql(u8, lhs.constructor, rhs.constructor)) {
+                    continue;
+                }
+
+                if (lhs.args.len != rhs.args.len) {
+                    continue;
+                }
+
+                if (self.debug) std.debug.print("{}: Expanding\n", .{constraint});
+
+                for (lhs.args) |lhs_arg, j| {
+                    var rhs_arg = rhs.args[j];
+                    try to_add.append(self.gpa, .{ .lhs = lhs_arg, .rhs = rhs_arg });
+                    if (self.debug) std.debug.print("  {} ~ {}\n", .{ lhs_arg, rhs_arg });
+                }
+
+                made_progress = true;
+            }
+
+            for (to_add.items) |c| {
+                try self.constraints.append(self.gpa, c);
+            }
+
+            self.pruneConstraints();
+        }
+    }
+
     fn infer(self: *Analysis, exprs: []const *Expr) !void {
         for (exprs) |ex| {
-            _ = try self.generateConstraints(ex);
-            try self.debug();
+            const res = try self.generateConstraints(ex);
+            _ = res;
+
+            if (self.debug) try self.printVarsAndConstraints();
+
+            try self.solve();
 
             self.expr_type_vars.clearRetainingCapacity();
             self.var_type_vars.clearRetainingCapacity();
@@ -255,12 +418,13 @@ pub fn main() !void {
 
     var al = std.ArrayListUnmanaged(*Expr){};
     try al.append(a, try b.function("id", &[1][]const u8{"x"}, try b.variable("x")));
-    try al.append(a, try b.apply(try b.variable("id"), &[1]*Expr{try b.lit(.{ .int = 5 })}));
+    // try al.append(a, try b.apply(try b.variable("id"), &[1]*Expr{try b.lit(.{ .int = 5 })}));
 
     for (al.items) |expr| {
         std.debug.print("{}\n", .{expr});
     }
 
     var sys = Analysis.init(a);
+    sys.debug = true;
     try sys.infer(al.items);
 }
