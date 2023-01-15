@@ -27,7 +27,7 @@ pub const Expr = union(enum) {
         _ = opts;
         _ = fmt;
         switch (self.*) {
-            .variable => |v| try writer.writeAll(v),
+            .variable => |v| try writer.print("({s})", .{v}),
             .literal => |l| try writer.print("{}", .{l}),
             .function => |f| {
                 try writer.print("(fn {s} [", .{f.name});
@@ -114,20 +114,136 @@ const ExprBuilder = struct {
     }
 };
 
-pub const Constraint = union(enum) { eq: struct { lhs: TypeVar, rhs: TypeVar } };
+const Constraint = struct {
+    lhs: TypeVar,
+    rhs: TypeVar,
 
-pub const Subsitutions = std.AutoHashMap(TypeVar, TypeVar);
+    pub fn format(self: *const Constraint, comptime fmt: []const u8, opts: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = opts;
+        _ = fmt;
 
-fn infer(alloc: std.mem.Allocator, stmts: []Expr) !void {
-    _ = stmts;
-    _ = alloc;
-}
+        try writer.print("{} ~ {}", .{ self.lhs, self.rhs });
+    }
+};
 
-fn e(alloc: std.mem.Allocator, expr: Expr) !*Expr {
-    var new = try alloc.create(Expr);
-    new.* = expr;
-    return new;
-}
+const Analysis = struct {
+    gpa: std.mem.Allocator,
+    constraints: std.ArrayListUnmanaged(Constraint),
+    subs: std.ArrayListUnmanaged(struct { lhs: TypeVar, rhs: TypeVar }),
+    expr_type_vars: std.AutoHashMapUnmanaged(*const Expr, TypeVar),
+    var_type_vars: std.StringHashMapUnmanaged(TypeVar),
+
+    next_var: u32,
+
+    fn init(gpa: std.mem.Allocator) Analysis {
+        return .{
+            .gpa = gpa,
+            .expr_type_vars = .{},
+            .var_type_vars = .{},
+            .constraints = .{},
+            .subs = .{},
+            .next_var = 0,
+        };
+    }
+
+    fn tyvar(self: *Analysis) TypeVar {
+        var tv = TypeVar{ .variable = self.next_var };
+        self.next_var += 1;
+        return tv;
+    }
+
+    fn generateConstraints(self: *Analysis, expr: *const Expr) !TypeVar {
+        const tv = self.tyvar();
+        switch (expr.*) {
+            .variable => |v| {
+                try self.expr_type_vars.put(self.gpa, expr, tv);
+
+                var gop = try self.var_type_vars.getOrPut(self.gpa, v);
+                if (!gop.found_existing) gop.value_ptr.* = self.tyvar();
+                try self.constraints.append(self.gpa, .{ .lhs = tv, .rhs = gop.value_ptr.* });
+            },
+            .literal => |l| try self.constraints.append(self.gpa, .{ .lhs = tv, .rhs = switch (l) {
+                .int => .{ .concrete = .int },
+                .boolean => .{ .concrete = .boolean },
+                .string => .{ .concrete = .string },
+            } }),
+            .function => |f| {
+                try self.var_type_vars.put(self.gpa, f.name, tv);
+
+                var args = std.ArrayListUnmanaged(TypeVar){};
+
+                for (f.params) |param| {
+                    var p_tv = self.tyvar();
+                    try args.append(self.gpa, p_tv);
+                    try self.var_type_vars.put(self.gpa, param, p_tv);
+                }
+
+                var b_tv = try self.generateConstraints(f.body);
+                try args.append(self.gpa, b_tv);
+
+                try self.constraints.append(self.gpa, .{
+                    .lhs = tv,
+                    .rhs = .{
+                        .concrete = .{ .construct = .{ .constructor = "->", .args = try args.toOwnedSlice(self.gpa) } },
+                    },
+                });
+            },
+            .apply => |a| {
+                const f_tv = try self.generateConstraints(a.function);
+
+                var args = std.ArrayListUnmanaged(TypeVar){};
+                for (a.arguments) |arg| {
+                    const a_tv = try self.generateConstraints(arg);
+                    try args.append(self.gpa, a_tv);
+                }
+
+                const ret_tv = self.tyvar();
+                try args.append(self.gpa, ret_tv);
+
+                try self.constraints.append(self.gpa, .{ .lhs = tv, .rhs = ret_tv });
+                try self.constraints.append(self.gpa, .{
+                    .lhs = f_tv,
+                    .rhs = .{
+                        .concrete = .{ .construct = .{ .constructor = "->", .args = try args.toOwnedSlice(self.gpa) } },
+                    },
+                });
+            },
+        }
+
+        return tv;
+    }
+
+    fn debug(self: *const Analysis) !void {
+        std.debug.print("=============== VARS ===============\n", .{});
+        {
+            var it = self.var_type_vars.iterator();
+            while (it.next()) |entry|
+                std.debug.print("{s} : {}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+        }
+
+        {
+            var it = self.expr_type_vars.iterator();
+            while (it.next()) |entry|
+                std.debug.print("{} : {}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+        }
+
+        std.debug.print("============ CONSTRAINT ============\n", .{});
+        for (self.constraints.items) |constraint| {
+            std.debug.print("{}\n", .{constraint});
+        }
+    }
+
+    fn infer(self: *Analysis, exprs: []const *Expr) !void {
+        for (exprs) |ex| {
+            _ = try self.generateConstraints(ex);
+            try self.debug();
+
+            self.expr_type_vars.clearRetainingCapacity();
+            self.var_type_vars.clearRetainingCapacity();
+            self.constraints.clearRetainingCapacity();
+        }
+    }
+};
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -144,4 +260,7 @@ pub fn main() !void {
     for (al.items) |expr| {
         std.debug.print("{}\n", .{expr});
     }
+
+    var sys = Analysis.init(a);
+    try sys.infer(al.items);
 }
